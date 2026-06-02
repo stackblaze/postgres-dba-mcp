@@ -35,11 +35,11 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
-LABEL org.opencontainers.image.description="Postgres MCP Agent - Multi-architecture container (${TARGETPLATFORM})"
-LABEL org.opencontainers.image.source="https://github.com/crystaldba/postgres-mcp"
+LABEL org.opencontainers.image.description="Stackblaze postgres-dba-mcp - per-add-on database-admin MCP (fork of crystaldba/postgres-mcp)"
+LABEL org.opencontainers.image.source="https://github.com/stackblaze/postgres-dba-mcp"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
-LABEL org.opencontainers.image.vendor="Crystal DBA"
-LABEL org.opencontainers.image.url="https://www.crystaldba.ai"
+LABEL org.opencontainers.image.vendor="Stackblaze"
+LABEL org.opencontainers.image.url="https://github.com/stackblaze/postgres-dba-mcp"
 
 # Install runtime system dependencies
 RUN apt-get update && apt-get install -y \
