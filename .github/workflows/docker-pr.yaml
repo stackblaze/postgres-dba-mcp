@@ -1,8 +1,8 @@
 name: Docker PR build (no push)
 
 # Mirrors stackblaze/kubero-mcp's docker-pr.yaml: validate the image
-# builds on every PR to main, without pushing anything. Single-arch
-# (amd64) for speed -- the multi-arch build happens on release.
+# builds on every PR to main, without pushing anything. amd64 only
+# (the runner + cluster nodes are all x64; same as docker-release).
 
 on:
   pull_request:
