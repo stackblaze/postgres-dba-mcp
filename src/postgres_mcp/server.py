@@ -554,6 +554,151 @@ async def get_top_queries(
         return format_error_response(str(e))
 
 
+# --------------------------------------------------------------------------- #
+# Discrete DBA tools (stackblaze fork). The upstream exposes analysis + a single
+# `execute_sql`; these add explicit, validated buttons for common day-2 admin so
+# the agent doesn't hand-write DDL. READ tools register always; WRITE tools are
+# registered only in UNRESTRICTED mode (see main) — so a `production` add-on
+# spawned `--access-mode restricted` is analyse/query only.
+# --------------------------------------------------------------------------- #
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
+
+def _ident(name: str) -> str:
+    """Validate a SQL identifier (role/database name) and return it double-quoted.
+
+    Strict allowlist — rejects anything that isn't a plain identifier — so it is
+    safe to interpolate into DDL where bind params aren't allowed."""
+    if not isinstance(name, str) or not _IDENT_RE.match(name):
+        raise ValueError(f"Invalid identifier: {name!r} (expected letters, digits, underscore; ≤63 chars)")
+    return '"' + name + '"'
+
+
+@mcp.tool(
+    description="List database roles/users with their key attributes (login, superuser, createdb, createrole, connection limit).",
+    annotations=ToolAnnotations(title="List Roles", readOnlyHint=True),
+)
+async def list_roles() -> ResponseType:
+    try:
+        sql_driver = await get_sql_driver()
+        rows = await sql_driver.execute_query(
+            """
+            SELECT rolname, rolsuper, rolcreatedb, rolcreaterole,
+                   rolcanlogin, rolreplication, rolconnlimit, rolvaliduntil
+            FROM pg_roles ORDER BY rolname
+            """
+        )
+        return format_text_response([r.cells for r in rows] if rows else [])
+    except Exception as e:
+        logger.error(f"Error listing roles: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(
+    description="List databases in this cluster with owner and encoding.",
+    annotations=ToolAnnotations(title="List Databases", readOnlyHint=True),
+)
+async def list_databases() -> ResponseType:
+    try:
+        sql_driver = await get_sql_driver()
+        rows = await sql_driver.execute_query(
+            """
+            SELECT d.datname,
+                   pg_catalog.pg_get_userbyid(d.datdba) AS owner,
+                   pg_catalog.pg_encoding_to_char(d.encoding) AS encoding,
+                   pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) AS size
+            FROM pg_catalog.pg_database d
+            WHERE d.datistemplate = false
+            ORDER BY d.datname
+            """
+        )
+        return format_text_response([r.cells for r in rows] if rows else [])
+    except Exception as e:
+        logger.error(f"Error listing databases: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(
+    description="List active backend sessions (pid, user, database, state, wait, and a truncated current query).",
+    annotations=ToolAnnotations(title="List Active Sessions", readOnlyHint=True),
+)
+async def list_active_sessions() -> ResponseType:
+    try:
+        sql_driver = await get_sql_driver()
+        rows = await sql_driver.execute_query(
+            """
+            SELECT pid, usename, datname, state, wait_event_type, wait_event,
+                   xact_start, query_start, left(query, 120) AS query
+            FROM pg_stat_activity
+            WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+            ORDER BY query_start NULLS LAST
+            """
+        )
+        return format_text_response([r.cells for r in rows] if rows else [])
+    except Exception as e:
+        logger.error(f"Error listing sessions: {e}")
+        return format_error_response(str(e))
+
+
+# --- WRITE tools (registered only in UNRESTRICTED mode) --------------------- #
+
+async def create_role(
+    role_name: str = Field(description="Name of the role/user to create (plain identifier)"),
+    password: str | None = Field(description="Password for the role; omit for a no-login/no-password role", default=None),
+    can_login: bool = Field(description="Grant LOGIN (i.e. a usable user)", default=True),
+    can_create_db: bool = Field(description="Grant CREATEDB", default=False),
+) -> ResponseType:
+    """Create a database role/user."""
+    try:
+        ident = _ident(role_name)
+        opts = ["LOGIN" if can_login else "NOLOGIN"]
+        if can_create_db:
+            opts.append("CREATEDB")
+        if password is not None:
+            # DDL can't bind params for PASSWORD; escape the literal safely.
+            esc = password.replace("'", "''")
+            opts.append(f"PASSWORD '{esc}'")
+        sql = f"CREATE ROLE {ident} {' '.join(opts)}"
+        sql_driver = await get_sql_driver()
+        await sql_driver.execute_query(sql)
+        return format_text_response(f"Role {role_name} created.")
+    except Exception as e:
+        logger.error(f"Error creating role: {e}")
+        return format_error_response(str(e))
+
+
+async def drop_role(
+    role_name: str = Field(description="Name of the role to drop (plain identifier)"),
+) -> ResponseType:
+    """Drop a database role (IF EXISTS)."""
+    try:
+        ident = _ident(role_name)
+        sql_driver = await get_sql_driver()
+        await sql_driver.execute_query(f"DROP ROLE IF EXISTS {ident}")
+        return format_text_response(f"Role {role_name} dropped (if it existed).")
+    except Exception as e:
+        logger.error(f"Error dropping role: {e}")
+        return format_error_response(str(e))
+
+
+async def terminate_session(
+    pid: int = Field(description="Backend PID to terminate (from list_active_sessions)"),
+) -> ResponseType:
+    """Terminate a backend session by pid (pg_terminate_backend)."""
+    try:
+        if not isinstance(pid, int):
+            return format_error_response("pid must be an integer")
+        sql_driver = await get_sql_driver()
+        rows = await SafeSqlDriver.execute_param_query(
+            sql_driver, "SELECT pg_terminate_backend({}) AS terminated", [pid]
+        )
+        return format_text_response([r.cells for r in rows] if rows else "No result")
+    except Exception as e:
+        logger.error(f"Error terminating session: {e}")
+        return format_error_response(str(e))
+
+
 async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="PostgreSQL MCP Server")
@@ -612,6 +757,23 @@ async def main():
                 title="Execute SQL",
                 destructiveHint=True,
             ),
+        )
+        # Discrete WRITE DBA tools — UNRESTRICTED only, so a `production` add-on
+        # spawned in restricted mode never exposes them.
+        mcp.add_tool(
+            create_role,
+            description="Create a database role/user",
+            annotations=ToolAnnotations(title="Create Role"),
+        )
+        mcp.add_tool(
+            drop_role,
+            description="Drop a database role",
+            annotations=ToolAnnotations(title="Drop Role", destructiveHint=True),
+        )
+        mcp.add_tool(
+            terminate_session,
+            description="Terminate a backend session by pid",
+            annotations=ToolAnnotations(title="Terminate Session", destructiveHint=True),
         )
     else:
         mcp.add_tool(

@@ -1,0 +1,30 @@
+name: Docker PR build (no push)
+
+# Mirrors stackblaze/kubero-mcp's docker-pr.yaml: validate the image
+# builds on every PR to main, without pushing anything. Single-arch
+# (amd64) for speed -- the multi-arch build happens on release.
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+
+jobs:
+  build:
+    runs-on: [self-hosted, kubero]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

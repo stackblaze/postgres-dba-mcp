@@ -1,0 +1,55 @@
+name: Auto-tag on push to main
+
+# Every merge to main produces an auto-incremented sb.NN tag, which in
+# turn fires docker-release.yaml (build the image). Pattern:
+# vX.Y.Z-sb.NN. To bump the base (e.g. 0.3.0 -> 0.4.0), push that tag
+# manually once; subsequent auto-tags continue from the new base.
+#
+# Mirrors stackblaze/kubero-mcp's auto-tag chain. The fork's own
+# release line is the -sb.NN suffix so it never collides with upstream
+# crystaldba tags (v0.3.0, v0.2.1, ...) merged in from `upstream`.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+
+jobs:
+  tag:
+    runs-on: [self-hosted, kubero]
+    # GITHUB_TOKEN-pushed tags don't trigger downstream workflows. If
+    # you want docker-release.yaml to auto-fire on these tags, set a
+    # CHAIN_PAT secret with a fine-grained PAT (contents:write) and
+    # swap the token below. Without CHAIN_PAT the tag still lands; you
+    # just have to run docker-release.yaml manually (or via re-push).
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CHAIN_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Compute next sb.N tag
+        id: next
+        run: |
+          set -euo pipefail
+          latest=$(git tag --list 'v*.*.*-sb.*' | sort -V | tail -1 || true)
+          if [ -z "$latest" ]; then
+            echo "::error::No existing v*.*.*-sb.N tag found; push one manually first (e.g. v0.3.0-sb.0) to set the base."
+            exit 1
+          fi
+          base="${latest%-sb.*}"
+          n="${latest##*-sb.}"
+          next_n=$((n + 1))
+          next="${base}-sb.${next_n}"
+          echo "Latest: $latest -> next: $next"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Push tag
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag '${{ steps.next.outputs.tag }}'
+          git push origin '${{ steps.next.outputs.tag }}'
