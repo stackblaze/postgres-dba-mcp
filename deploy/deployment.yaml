@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-dba-mcp
+  namespace: kubero-mcp
+  labels:
+    app.kubernetes.io/name: postgres-dba-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres-dba-mcp
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres-dba-mcp
+    spec:
+      containers:
+      - name: postgres-dba-mcp
+        # Tag patched to the released sb.NN by deploy.yaml (set image).
+        image: ghcr.io/stackblaze/postgres-dba-mcp:latest
+        imagePullPolicy: IfNotPresent
+        # Long-lived per-type service: ONE instance serves every Postgres add-on
+        # in this cluster. No DATABASE_URI at boot — the kubero broker passes the
+        # target DB + access mode per request via X-Kubero-DB-URI /
+        # X-Kubero-Access-Mode headers (connection-from-request mode).
+        args:
+        - --transport
+        - streamable-http
+        - --connection-from-request
+        - --streamable-http-host
+        - 0.0.0.0
+        - --streamable-http-port
+        - "3010"
+        ports:
+        - name: http
+          containerPort: 3010
+        # The MCP /mcp endpoint needs a session handshake, so probe the TCP port
+        # rather than an HTTP path (there is no /healthz). Liveness == listening.
+        readinessProbe:
+          tcpSocket:
+            port: http
+          periodSeconds: 5
+        livenessProbe:
+          tcpSocket:
+            port: http
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        securityContext:
+          # Image already runs as the non-root `app` user (USER app). Keep the
+          # rest of the hardening; leave the rootfs writable (psycopg/tmp).
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]

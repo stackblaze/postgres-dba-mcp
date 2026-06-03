@@ -1,10 +1,13 @@
 # ruff: noqa: B008
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
+import re
 import signal
 import sys
+import time
 from enum import Enum
 from typing import Any
 from typing import List
@@ -14,6 +17,17 @@ from typing import Union
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+
+# The lowlevel server sets this contextvar for the duration of every request, so
+# any code in the tool call stack (e.g. get_sql_driver) can read the incoming
+# HTTP request — and thus the per-request connection headers — without threading
+# a Context parameter through every tool. Imported defensively: on transports
+# without an HTTP request (stdio) request_ctx.get() raises LookupError / .request
+# is None, which we treat as "not connection-from-request".
+try:
+    from mcp.server.lowlevel.server import request_ctx as _request_ctx
+except Exception:  # pragma: no cover - defensive
+    _request_ctx = None
 from pydantic import Field
 from pydantic import validate_call
 
@@ -58,17 +72,153 @@ db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
 
+# Per-request-connection mode (stackblaze fork). When True the process is NOT
+# bound to one DATABASE_URI at boot; instead each request carries its target via
+# the X-Kubero-DB-URI header (and X-Kubero-Access-Mode), so a single long-lived
+# Deployment serves every Postgres add-on in the cluster. The kubero broker
+# resolves the connection per chat-selected add-on and sets these headers.
+connection_from_request = False
+
+# Header names the broker sets per request.
+HDR_DB_URI = "x-kubero-db-uri"
+HDR_ACCESS_MODE = "x-kubero-access-mode"
+
+
+class _ConnRegistry:
+    """Lazily-created pool of DbConnPools keyed by connection URI.
+
+    One process serves many add-on DBs (connection-from-request mode). Pools are
+    created on first use for a URI and evicted after an idle period so we don't
+    hold connections to add-ons no longer in any chat context. Bounded so a busy
+    instance can't open unbounded pools.
+    """
+
+    def __init__(self, max_idle_seconds: int = 300, max_pools: int = 32):
+        self._pools: dict[str, dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+        self._max_idle = max_idle_seconds
+        self._max_pools = max_pools
+
+    @staticmethod
+    def _key(uri: str) -> str:
+        return hashlib.sha256(uri.encode("utf-8")).hexdigest()
+
+    async def get(self, uri: str) -> DbConnPool:
+        key = self._key(uri)
+        async with self._lock:
+            await self._evict_idle_locked()
+            entry = self._pools.get(key)
+            if entry is None:
+                if len(self._pools) >= self._max_pools:
+                    await self._evict_oldest_locked()
+                pool = DbConnPool()
+                await pool.pool_connect(uri)
+                entry = {"pool": pool}
+                self._pools[key] = entry
+            entry["last_used"] = time.monotonic()
+            return entry["pool"]
+
+    async def _evict_idle_locked(self) -> None:
+        now = time.monotonic()
+        stale = [k for k, e in self._pools.items() if now - e.get("last_used", now) > self._max_idle]
+        for k in stale:
+            await self._close_entry(self._pools.pop(k))
+
+    async def _evict_oldest_locked(self) -> None:
+        if not self._pools:
+            return
+        oldest = min(self._pools.items(), key=lambda kv: kv[1].get("last_used", 0))
+        await self._close_entry(self._pools.pop(oldest[0]))
+
+    @staticmethod
+    async def _close_entry(entry: dict[str, Any]) -> None:
+        try:
+            await entry["pool"].close()
+        except Exception as e:  # pragma: no cover - best effort
+            logger.warning(f"Error closing pooled connection: {e}")
+
+    async def close_all(self) -> None:
+        async with self._lock:
+            for entry in self._pools.values():
+                await self._close_entry(entry)
+            self._pools.clear()
+
+
+conn_registry = _ConnRegistry()
+
+
+def _request_headers():
+    """Return the incoming request's headers (case-insensitive) or None.
+
+    None means there is no HTTP request in scope (e.g. stdio transport), in which
+    case the caller falls back to the process-global connection / access mode.
+    """
+    if _request_ctx is None:
+        return None
+    try:
+        rc = _request_ctx.get()
+    except LookupError:
+        return None
+    req = getattr(rc, "request", None)
+    if req is None:
+        return None
+    return getattr(req, "headers", None)
+
+
+def _effective_access_mode() -> AccessMode:
+    """Access mode for the current call.
+
+    In connection-from-request mode it comes from the per-request header and
+    defaults to RESTRICTED when missing/invalid (fail safe — a production add-on
+    must never silently get write access)."""
+    if connection_from_request:
+        headers = _request_headers()
+        raw = headers.get(HDR_ACCESS_MODE) if headers else None
+        if not raw:
+            return AccessMode.RESTRICTED
+        try:
+            return AccessMode(raw)
+        except ValueError:
+            return AccessMode.RESTRICTED
+    return current_access_mode
+
 
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
-    """Get the appropriate SQL driver based on the current access mode."""
-    base_driver = SqlDriver(conn=db_connection)
+    """Get the appropriate SQL driver for this call.
 
-    if current_access_mode == AccessMode.RESTRICTED:
+    Connection-from-request: resolve the per-URI pool + access mode from the
+    request headers. Otherwise: the process-global pool + boot access mode."""
+    access_mode = current_access_mode
+    conn: DbConnPool = db_connection
+
+    if connection_from_request:
+        headers = _request_headers()
+        uri = headers.get(HDR_DB_URI) if headers else None
+        if not uri:
+            raise ValueError(f"connection-from-request mode: missing {HDR_DB_URI} header")
+        access_mode = _effective_access_mode()
+        conn = await conn_registry.get(uri)
+
+    base_driver = SqlDriver(conn=conn)
+
+    if access_mode == AccessMode.RESTRICTED:
         logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
         return SafeSqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
     else:
         logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
         return base_driver
+
+
+def _require_unrestricted() -> ResponseType | None:
+    """Guard for WRITE tools. In connection-from-request mode the access mode is
+    per-request, so write tools are always registered but must refuse when the
+    selected add-on is restricted (e.g. a production phase). Returns an error
+    response to short-circuit, or None when the write is allowed."""
+    if _effective_access_mode() == AccessMode.RESTRICTED:
+        return format_error_response(
+            "This operation requires unrestricted access; the selected add-on is read-only (restricted) mode."
+        )
+    return None
 
 
 def format_text_response(text: Any) -> ResponseType:
@@ -650,6 +800,9 @@ async def create_role(
     can_create_db: bool = Field(description="Grant CREATEDB", default=False),
 ) -> ResponseType:
     """Create a database role/user."""
+    denied = _require_unrestricted()
+    if denied is not None:
+        return denied
     try:
         ident = _ident(role_name)
         opts = ["LOGIN" if can_login else "NOLOGIN"]
@@ -672,6 +825,9 @@ async def drop_role(
     role_name: str = Field(description="Name of the role to drop (plain identifier)"),
 ) -> ResponseType:
     """Drop a database role (IF EXISTS)."""
+    denied = _require_unrestricted()
+    if denied is not None:
+        return denied
     try:
         ident = _ident(role_name)
         sql_driver = await get_sql_driver()
@@ -686,6 +842,9 @@ async def terminate_session(
     pid: int = Field(description="Backend PID to terminate (from list_active_sessions)"),
 ) -> ResponseType:
     """Terminate a backend session by pid (pg_terminate_backend)."""
+    denied = _require_unrestricted()
+    if denied is not None:
+        return denied
     try:
         if not isinstance(pid, int):
             return format_error_response("pid must be an integer")
@@ -718,6 +877,17 @@ async def main():
         help="Select MCP transport: stdio (default), sse, or streamable-http",
     )
     parser.add_argument(
+        "--connection-from-request",
+        action="store_true",
+        help=(
+            "Per-request connection mode (stackblaze fork). Do not bind to one "
+            "DATABASE_URI at boot; instead read the target per request from the "
+            f"'{HDR_DB_URI}' header and the access mode from '{HDR_ACCESS_MODE}'. "
+            "Lets one long-lived Deployment serve every Postgres add-on. Requires "
+            "an HTTP transport (streamable-http/sse)."
+        ),
+    )
+    parser.add_argument(
         "--sse-host",
         type=str,
         default="localhost",
@@ -744,12 +914,26 @@ async def main():
 
     args = parser.parse_args()
 
-    # Store the access mode in the global variable
-    global current_access_mode
+    # Store the access mode + connection mode in the global variables
+    global current_access_mode, connection_from_request
     current_access_mode = AccessMode(args.access_mode)
+    connection_from_request = bool(args.connection_from_request)
 
-    # Add the query tool with a description and annotations appropriate to the access mode
-    if current_access_mode == AccessMode.UNRESTRICTED:
+    if connection_from_request and args.transport == "stdio":
+        raise ValueError("--connection-from-request requires an HTTP transport (streamable-http or sse), not stdio.")
+
+    # Register the query + write tools.
+    #
+    # connection-from-request: ONE process serves both restricted (e.g. prod) and
+    # unrestricted (dev/review) callers, decided per request — so we can't gate by
+    # registration. Register the full surface; access is enforced per call by
+    # get_sql_driver() (SafeSqlDriver) + the _require_unrestricted() write guards.
+    #
+    # single-DB (legacy/standalone): keep upstream behaviour — write tools only in
+    # UNRESTRICTED mode so a restricted process never exposes them at all.
+    register_writes = connection_from_request or current_access_mode == AccessMode.UNRESTRICTED
+
+    if register_writes:
         mcp.add_tool(
             execute_sql,
             description="Execute any SQL query",
@@ -758,8 +942,6 @@ async def main():
                 destructiveHint=True,
             ),
         )
-        # Discrete WRITE DBA tools — UNRESTRICTED only, so a `production` add-on
-        # spawned in restricted mode never exposes them.
         mcp.add_tool(
             create_role,
             description="Create a database role/user",
@@ -785,27 +967,33 @@ async def main():
             ),
         )
 
-    logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
+    mode_label = "CONNECTION-FROM-REQUEST" if connection_from_request else current_access_mode.upper()
+    logger.info(f"Starting PostgreSQL MCP Server in {mode_label} mode")
 
     # Get database URL from environment variable or command line
     database_url = os.environ.get("DATABASE_URI", args.database_url)
 
-    if not database_url:
-        raise ValueError(
-            "Error: No database URL provided. Please specify via 'DATABASE_URI' environment variable or command-line argument.",
-        )
-
-    # Initialize database connection pool
-    try:
-        await db_connection.pool_connect(database_url)
-        logger.info("Successfully connected to database and initialized connection pool")
-    except Exception as e:
-        logger.warning(
-            f"Could not connect to database: {obfuscate_password(str(e))}",
-        )
-        logger.warning(
-            "The MCP server will start but database operations will fail until a valid connection is established.",
-        )
+    if connection_from_request:
+        # No process-global connection; per-URI pools are created on demand from
+        # the request header. A boot DATABASE_URI (if any) is ignored.
+        if database_url:
+            logger.info("connection-from-request mode: ignoring boot DATABASE_URI; connections come from request headers")
+    else:
+        if not database_url:
+            raise ValueError(
+                "Error: No database URL provided. Please specify via 'DATABASE_URI' environment variable or command-line argument.",
+            )
+        # Initialize database connection pool
+        try:
+            await db_connection.pool_connect(database_url)
+            logger.info("Successfully connected to database and initialized connection pool")
+        except Exception as e:
+            logger.warning(
+                f"Could not connect to database: {obfuscate_password(str(e))}",
+            )
+            logger.warning(
+                "The MCP server will start but database operations will fail until a valid connection is established.",
+            )
 
     # Set up proper shutdown handling
     try:
@@ -848,6 +1036,7 @@ async def shutdown(sig=None):
     # Close database connections
     try:
         await db_connection.close()
+        await conn_registry.close_all()
         logger.info("Closed database connections")
     except Exception as e:
         logger.error(f"Error closing database connections: {e}")

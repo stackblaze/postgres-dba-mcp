@@ -1,0 +1,179 @@
+name: Deploy to cluster
+
+# Auto-deploy chain (per merge to main):
+#   push to main
+#     → auto-tag-on-main publishes vX.Y.Z-sb.NN
+#     → docker-release builds + pushes the image to GHCR + publishes a Release
+#     → THIS workflow rolls the long-lived per-type MCP Deployment (per cluster)
+#
+# Unlike kubero-mcp this deploys to the WORKLOAD cluster(s) where the add-on DBs
+# live (the MCP needs TCP reach to <instance>-rw), not the management cluster.
+# It is a ClusterIP-only Service — the kubero server reaches it via a k8s
+# port-forward over the cluster's apiserver, so there is no ingress to apply.
+#
+# Add a cluster by extending:
+#   1. workflow_dispatch.inputs.region options
+#   2. RELEASE_REGIONS in the plan job
+#   3. KUBECONFIG_B64_<REGION_UPPER> secret in this repo (the workload kubeconfig)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Workload cluster to deploy'
+        type: choice
+        required: true
+        default: shared
+        options:
+          - shared
+      tag:
+        description: 'Image tag (defaults to the latest published release)'
+        required: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: stackblaze/postgres-dba-mcp
+  NAMESPACE: kubero-mcp
+  DEPLOYMENT: postgres-dba-mcp
+
+jobs:
+  plan:
+    runs-on: [self-hosted, kubero]
+    outputs:
+      regions: ${{ steps.regions.outputs.regions }}
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - name: Resolve regions
+        id: regions
+        run: |
+          RELEASE_REGIONS='["shared"]'
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "regions=$RELEASE_REGIONS" >> "$GITHUB_OUTPUT"
+          else
+            printf 'regions=["%s"]\n' '${{ inputs.region }}' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag='${{ github.event.release.tag_name }}'
+          elif [ -n '${{ inputs.tag }}' ]; then
+            tag='${{ inputs.tag }}'
+          else
+            tag=$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName)
+          fi
+          echo "value=$tag" >> "$GITHUB_OUTPUT"
+          echo "Deploying tag: $tag"
+
+  deploy:
+    needs: plan
+    runs-on: [self-hosted, kubero]
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(needs.plan.outputs.regions) }}
+    environment:
+      name: workload-${{ matrix.region }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      REGION: ${{ matrix.region }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Deploy is opt-in per cluster: it only runs once the workload kubeconfig
+      # secret is wired. Until then a Release won't show a hard failure — the job
+      # just skips (the image is still built + published by docker-release).
+      - name: Gate on kubeconfig secret
+        id: gate
+        env:
+          KUBECONFIG_B64_SHARED: ${{ secrets.KUBECONFIG_B64_SHARED }}
+        run: |
+          case "$REGION" in
+            shared) blob="$KUBECONFIG_B64_SHARED" ;;
+            *) blob="" ;;
+          esac
+          if [ -z "$blob" ]; then
+            echo "::warning::KUBECONFIG_B64_$(echo "$REGION" | tr a-z A-Z) not set; skipping deploy for '$REGION'. Set the secret to enable auto-deploy."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify image is on GHCR
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_USER: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          basic=$(printf '%s:%s' "$GH_USER" "$GH_TOKEN" | base64 | tr -d '\n')
+          token=$(curl -fsSL \
+            -H "Authorization: Basic $basic" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_NAME}:pull" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          tries=0
+          until [ "$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+              -H 'Accept: application/vnd.oci.image.index.v1+json' \
+              "https://ghcr.io/v2/${IMAGE_NAME}/manifests/$TAG")" = "200" ]; do
+            tries=$((tries + 1))
+            if [ "$tries" -ge 30 ]; then
+              echo "::error::Image ghcr.io/${IMAGE_NAME}:$TAG not found after 5 minutes"
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Image confirmed: ghcr.io/${IMAGE_NAME}:$TAG"
+
+      - name: Install kubectl
+        if: steps.gate.outputs.skip != 'true'
+        uses: azure/setup-kubectl@v4
+
+      - name: Restore kubeconfig for ${{ matrix.region }}
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          KUBECONFIG_B64_SHARED: ${{ secrets.KUBECONFIG_B64_SHARED }}
+        run: |
+          case "$REGION" in
+            shared) blob="$KUBECONFIG_B64_SHARED" ;;
+            *) echo "::error::No kubeconfig secret wired for region '$REGION'."; exit 1 ;;
+          esac
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$blob" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Apply manifests (namespace/service are idempotent)
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          kubectl apply -f deploy/namespace.yaml
+          kubectl apply -f deploy/service.yaml
+          # Deployment is applied separately so the image: field doesn't clobber
+          # the live tag before we patch it below.
+          kubectl apply -f deploy/deployment.yaml
+
+      - name: Roll deployment to new image tag
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          kubectl -n "$NAMESPACE" set image "deploy/$DEPLOYMENT" \
+            "$DEPLOYMENT=ghcr.io/${IMAGE_NAME}:$TAG"
+
+      - name: Wait for rollout
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          kubectl rollout status -n "$NAMESPACE" \
+            "deploy/$DEPLOYMENT" --timeout=300s
+
+      - name: Show running pods
+        if: always() && steps.gate.outputs.skip != 'true'
+        run: |
+          kubectl get pods -n "$NAMESPACE" -o wide || true
